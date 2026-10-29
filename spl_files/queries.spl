@@ -1,0 +1,84 @@
+########################################################################
+# Splunk Log Analysis Lab - SPL Queries
+# SSH Brute Force & Web Reconnaissance Detection
+#
+# Data source: index=lab_logs (linux_secure + access_combined, Kali Linux)
+########################################################################
+
+
+########################################################################
+# 5.0  Ingestion check - confirm all sources landed in the index
+########################################################################
+
+index=lab_logs | stats count by sourcetype
+
+
+########################################################################
+# 5.1  Detect the SSH brute-force cluster
+#
+# Buckets failed logins into 1-minute windows and surfaces any
+# user/source-IP combination with more than 3 failures in that window.
+########################################################################
+
+index=lab_logs sourcetype=linux_secure "Failed password"
+| bin _time span=1m
+| stats count by _time, user, src_ip
+| where count > 3
+
+
+########################################################################
+# 5.2  Catch the failure-to-success transition
+#
+# Stitches together a run of failed logins that ends in a successful
+# login for the same user within a 5-minute window - the exact pattern
+# of a successful brute-force attempt.
+########################################################################
+
+index=lab_logs sourcetype=linux_secure ("Failed password" OR "Accepted password")
+| transaction user startswith="Failed password" endswith="Accepted password" maxspan=5m
+| table _time, user, duration, eventcount
+
+
+########################################################################
+# 5.3  Detect web reconnaissance / directory enumeration
+#
+# A single client IP hitting 4+ distinct nonexistent paths is treated
+# as a strong indicator of scanning/enumeration behavior.
+########################################################################
+
+index=lab_logs sourcetype=access_combined status=404
+| stats count, values(uri_path) as paths_tried by clientip
+| where count >= 4
+
+
+########################################################################
+# 5.4  Correlate timing across sources
+#
+# Lines up SSH auth events and web access events side by side, sorted
+# by time, to check whether the brute force and the web scan overlap
+# and share a source - evidence of one actor vs. two unrelated events.
+########################################################################
+
+index=lab_logs (sourcetype=linux_secure OR sourcetype=access_combined)
+| sort _time
+| table _time, sourcetype, src_ip, clientip, user, uri_path, status
+
+
+########################################################################
+# 5.5  (Optional - requires Zeek) Confirm brute force at the network layer
+#
+# Zeek's own auth_attempts field is an independent second source of
+# confirmation for the brute-force count already found in auth.log.
+########################################################################
+
+index=lab_logs sourcetype="bro:ssh" OR sourcetype="zeek:ssh"
+| table ts, id.orig_h, id.resp_h, auth_success, auth_attempts
+
+
+########################################################################
+# Stretch: scheduled alert candidate
+#
+# Save query 5.1 as a scheduled alert (every 5 minutes) to catch this
+# pattern automatically going forward. Adjust bin span / threshold if
+# testing against a slower, spread-out brute-force simulation.
+########################################################################
